@@ -578,6 +578,7 @@ pub struct Config {
     enable_relaxed_loss_threshold: bool,
 
     pmtud: bool,
+    pmtud_max_probes: u8,
 
     hystart: bool,
 
@@ -656,6 +657,7 @@ impl Config {
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
             enable_relaxed_loss_threshold: false,
             pmtud: false,
+            pmtud_max_probes: pmtud::MAX_PROBES_DEFAULT,
             hystart: true,
             pacing: true,
             max_pacing_rate: None,
@@ -771,6 +773,15 @@ impl Config {
     /// The default value is `false`.
     pub fn discover_pmtu(&mut self, discover: bool) {
         self.pmtud = discover;
+    }
+
+    /// Configures the maximum number of PMTUD probe attempts before treating
+    /// a probe size as failed.
+    ///
+    /// Defaults to 3 per [RFC 8899 Section 5.1.2](https://datatracker.ietf.org/doc/html/rfc8899#section-5.1.2).
+    /// If 0 is passed, the default value is used.
+    pub fn set_pmtud_max_probes(&mut self, max_probes: u8) {
+        self.pmtud_max_probes = max_probes;
     }
 
     /// Configures whether to send GREASE values.
@@ -1491,8 +1502,9 @@ where
 ///
 /// The `scid` parameter represents the server's source connection ID, while
 /// the optional `odcid` parameter represents the original destination ID the
-/// client sent before a stateless retry (this is only required when using
-/// the [`retry()`] function).
+/// client sent before a Retry packet (this is only required when using the
+/// [`retry()`] function). See also the [`accept_with_retry()`] function for
+/// more advanced retry cases.
 ///
 /// [`retry()`]: fn.retry.html
 ///
@@ -1506,14 +1518,12 @@ where
 /// let conn = quiche::accept(&scid, None, local, peer, &mut config)?;
 /// # Ok::<(), quiche::Error>(())
 /// ```
-#[inline]
+#[inline(always)]
 pub fn accept(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection> {
-    let conn = Connection::new(scid, odcid, local, peer, config, true)?;
-
-    Ok(conn)
+    accept_with_buf_factory(scid, odcid, local, peer, config)
 }
 
 /// Creates a new server-side connection, with a custom buffer generation
@@ -1526,9 +1536,49 @@ pub fn accept_with_buf_factory<F: BufFactory>(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection<F>> {
-    let conn = Connection::new(scid, odcid, local, peer, config, true)?;
+    // For connections with `odcid` set, we historically used `retry_source_cid =
+    // scid`. Keep this behavior to preserve backwards compatibility.
+    // `accept_with_retry` allows the SCIDs to be specified separately.
+    let retry_cids = odcid.map(|odcid| RetryConnectionIds {
+        original_destination_cid: odcid,
+        retry_source_cid: scid,
+    });
 
-    Ok(conn)
+    Connection::new(scid, retry_cids, local, peer, config, true)
+}
+
+/// A wrapper for connection IDs used in [`accept_with_retry`].
+pub struct RetryConnectionIds<'a> {
+    /// The DCID of the first Initial packet received by the server, which
+    /// triggered the Retry packet.
+    pub original_destination_cid: &'a ConnectionId<'a>,
+    /// The SCID of the Retry packet sent by the server. This can be different
+    /// from the new connection's SCID.
+    pub retry_source_cid: &'a ConnectionId<'a>,
+}
+
+/// Creates a new server-side connection after the client responded to a Retry
+/// packet.
+///
+/// To generate a Retry packet in the first place, use the [`retry()`] function.
+///
+/// The `scid` parameter represents the server's source connection ID, which can
+/// be freshly generated after the application has successfully verified the
+/// Retry. `retry_cids` is used to tie the new connection to the Initial + Retry
+/// exchange that preceded the connection's creation.
+///
+/// The DCID of the client's Initial packet is inherently untrusted data. It is
+/// safe to use the DCID in the `retry_source_cid` field of the
+/// `RetryConnectionIds` provided to this function. However, using the Initial's
+/// DCID for the `scid` parameter carries risks. Applications are advised to
+/// implement their own DCID validation steps before using the DCID in that
+/// manner.
+#[inline]
+pub fn accept_with_retry<F: BufFactory>(
+    scid: &ConnectionId, retry_cids: RetryConnectionIds, local: SocketAddr,
+    peer: SocketAddr, config: &mut Config,
+) -> Result<Connection<F>> {
+    Connection::new(scid, Some(retry_cids), local, peer, config, true)
 }
 
 /// Creates a new client-side connection.
@@ -1766,16 +1816,20 @@ impl Default for QlogInfo {
 
 impl<F: BufFactory> Connection<F> {
     fn new(
-        scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-        peer: SocketAddr, config: &mut Config, is_server: bool,
+        scid: &ConnectionId, retry_cids: Option<RetryConnectionIds>,
+        local: SocketAddr, peer: SocketAddr, config: &mut Config,
+        is_server: bool,
     ) -> Result<Connection<F>> {
         let tls = config.tls_ctx.new_handshake()?;
-        Connection::with_tls(scid, odcid, local, peer, config, tls, is_server)
+        Connection::with_tls(
+            scid, retry_cids, local, peer, config, tls, is_server,
+        )
     }
 
     fn with_tls(
-        scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
-        peer: SocketAddr, config: &Config, tls: tls::Handshake, is_server: bool,
+        scid: &ConnectionId, retry_cids: Option<RetryConnectionIds>,
+        local: SocketAddr, peer: SocketAddr, config: &Config,
+        tls: tls::Handshake, is_server: bool,
     ) -> Result<Connection<F>> {
         let max_rx_data = config.local_transport_params.initial_max_data;
 
@@ -1799,8 +1853,8 @@ impl<F: BufFactory> Connection<F> {
             Some(config),
         );
 
-        // If we did stateless retry assume the peer's address is verified.
-        path.verified_peer_address = odcid.is_some();
+        // If we sent a Retry assume the peer's address is verified.
+        path.verified_peer_address = retry_cids.is_some();
         // Assume clients validate the server's address implicitly.
         path.peer_verified_local_address = is_server;
 
@@ -1983,12 +2037,13 @@ impl<F: BufFactory> Connection<F> {
             max_amplification_factor: config.max_amplification_factor,
         };
 
-        if let Some(odcid) = odcid {
+        if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
-                .original_destination_connection_id = Some(odcid.to_vec().into());
+                .original_destination_connection_id =
+                Some(retry_cids.original_destination_cid.to_vec().into());
 
             conn.local_transport_params.retry_source_connection_id =
-                Some(conn.ids.get_scid(0)?.cid.to_vec().into());
+                Some(retry_cids.retry_source_cid.to_vec().into());
 
             conn.did_retry = true;
         }
@@ -2408,11 +2463,11 @@ impl<F: BufFactory> Connection<F> {
     #[cfg(feature = "boringssl-boring-crate")]
     #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
     pub fn set_discover_pmtu_in_handshake(
-        ssl: &mut boring::ssl::SslRef, discover: bool,
+        ssl: &mut boring::ssl::SslRef, discover: bool, max_probes: u8,
     ) -> Result<()> {
         let ex_data = tls::ExData::from_ssl_ref(ssl).ok_or(Error::TlsFail)?;
 
-        ex_data.pmtud = Some(discover);
+        ex_data.pmtud = Some((discover, max_probes));
 
         Ok(())
     }
@@ -7441,9 +7496,14 @@ impl<F: BufFactory> Connection<F> {
             Ok(_) => (),
 
             Err(Error::Done) => {
-                // Apply in-handshake configuration from callbacks before any
-                // packet has been sent.
-                if self.sent_count == 0 {
+                // Apply in-handshake configuration from callbacks if the path's
+                // Recovery module can still be reinitilized.
+                if self
+                    .paths
+                    .get_active()
+                    .map(|p| p.can_reinit_recovery())
+                    .unwrap_or(false)
+                {
                     if ex_data.recovery_config != self.recovery_config {
                         if let Ok(path) = self.paths.get_active_mut() {
                             self.recovery_config = ex_data.recovery_config;
@@ -7455,10 +7515,11 @@ impl<F: BufFactory> Connection<F> {
                         self.tx_cap_factor = ex_data.tx_cap_factor;
                     }
 
-                    if let Some(discover) = ex_data.pmtud {
+                    if let Some((discover, max_probes)) = ex_data.pmtud {
                         self.paths.set_discover_pmtu_on_existing_paths(
                             discover,
                             self.recovery_config.max_send_udp_payload_size,
+                            max_probes,
                         );
                     }
 
