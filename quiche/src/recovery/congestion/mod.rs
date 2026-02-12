@@ -283,6 +283,7 @@ impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
         match algo {
             CongestionControlAlgorithm::Reno => &reno::RENO,
             CongestionControlAlgorithm::CUBIC => &cubic::CUBIC,
+            CongestionControlAlgorithm::None => &none::NONE,
             // Bbr2Gcongestion is routed to the congestion implementation in
             // the gcongestion directory by Recovery::new_with_config;
             // LegacyRecovery never gets a RecoveryConfig with the
@@ -348,6 +349,7 @@ mod tests {
 mod cubic;
 mod delivery_rate;
 mod hystart;
+mod none;
 mod prr;
 pub(crate) mod recovery;
 mod reno;
