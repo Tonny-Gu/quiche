@@ -365,6 +365,8 @@ pub enum CongestionControlAlgorithm {
     Reno            = 0,
     /// CUBIC congestion control algorithm (default). `cubic` in a string form.
     CUBIC           = 1,
+    /// No congestion control. `none` in a string form.
+    None            = 2,
     /// BBRv2 congestion control algorithm implementation from gcongestion
     /// branch. `bbr2_gcongestion` in a string form.
     Bbr2Gcongestion = 4,
@@ -380,6 +382,7 @@ impl FromStr for CongestionControlAlgorithm {
         match name {
             "reno" => Ok(CongestionControlAlgorithm::Reno),
             "cubic" => Ok(CongestionControlAlgorithm::CUBIC),
+            "none" => Ok(CongestionControlAlgorithm::None),
             "bbr" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2_gcongestion" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
@@ -757,6 +760,10 @@ mod tests {
         assert_eq!(algo, CongestionControlAlgorithm::CUBIC);
         assert!(!recovery_for_alg(algo).gcongestion_enabled());
 
+        let algo = CongestionControlAlgorithm::from_str("none").unwrap();
+        assert_eq!(algo, CongestionControlAlgorithm::None);
+        assert!(!recovery_for_alg(algo).gcongestion_enabled());
+
         let algo = CongestionControlAlgorithm::from_str("bbr").unwrap();
         assert_eq!(algo, CongestionControlAlgorithm::Bbr2Gcongestion);
         assert!(recovery_for_alg(algo).gcongestion_enabled());
@@ -781,7 +788,7 @@ mod tests {
 
     #[rstest]
     fn loss_on_pto(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+        #[values("reno", "cubic", "none", "bbr2_gcongestion")] cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
@@ -1067,7 +1074,7 @@ mod tests {
 
     #[rstest]
     fn loss_on_timer(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+        #[values("reno", "cubic", "none", "bbr2_gcongestion")] cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
@@ -1263,7 +1270,7 @@ mod tests {
 
     #[rstest]
     fn loss_on_reordering(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+        #[values("reno", "cubic", "none", "bbr2_gcongestion")] cc_algorithm_name: &str,
     ) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
