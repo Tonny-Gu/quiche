@@ -48,6 +48,8 @@ use quiche::ConnectionId;
 use quiche::Header;
 use quiche::MAX_CONN_ID_LEN;
 use std::default::Default;
+use futures::future::FusedFuture;
+use futures::FutureExt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -152,6 +154,9 @@ where
     conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
     conn_map_cmd_rx: mpsc::UnboundedReceiver<ConnectionMapCommand>,
     accept_sink: mpsc::Sender<io::Result<InitialQuicConnection<Tx, M>>>,
+    /// Waker future that completes when the accept stream receiver is dropped.
+    /// Polling this registers a waker so the Router task is notified promptly.
+    accept_closed: Pin<Box<dyn FusedFuture<Output = ()> + Send>>,
     metrics: M,
     #[cfg(target_os = "linux")]
     udp_drop_count: u32,
@@ -181,6 +186,10 @@ where
     ) -> (Self, ConnStream<Tx, M>) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
+        let accept_sink_clone = accept_sink.clone();
+        let accept_closed = Box::pin(async move {
+            accept_sink_clone.closed().await
+        }.fuse());
         let (conn_map_cmd_tx, conn_map_cmd_rx) = mpsc::unbounded_channel();
 
         (
@@ -195,6 +204,7 @@ where
                 conn_map_cmd_tx,
                 conn_map_cmd_rx,
                 accept_sink,
+                accept_closed,
                 #[cfg(target_os = "linux")]
                 udp_drop_count: 0,
                 #[cfg(target_os = "linux")]
@@ -752,6 +762,12 @@ where
                 },
 
                 Poll::Pending => {
+                    // Register a waker for accept stream closure so the Router
+                    // is woken when the receiver is dropped. Without this, a
+                    // failed handshake leaves the Router stuck in Pending forever
+                    // because no other event (socket data, shutdown_rx) fires.
+                    let _ = self.accept_closed.as_mut().poll(cx);
+
                     // Check whether any connections are still active
                     if self.shutdown_tx.is_some() && self.accept_sink.is_closed()
                     {
