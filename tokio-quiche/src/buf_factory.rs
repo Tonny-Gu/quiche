@@ -45,7 +45,7 @@ use buffer_pool::Pooled;
 use datagram_socket::MAX_DATAGRAM_SIZE;
 
 const POOL_SHARDS: usize = 8;
-const POOL_SIZE: usize = 16 * 1024;
+const POOL_SIZE: usize = 128;
 const DATAGRAM_POOL_SIZE: usize = 64 * 1024;
 
 const TINY_BUF_SIZE: usize = 64;
