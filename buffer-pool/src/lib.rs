@@ -35,26 +35,8 @@ use std::sync::atomic::Ordering;
 
 use crossbeam::queue::SegQueue;
 
-use foundations::telemetry::metrics::metrics;
-use foundations::telemetry::metrics::Gauge;
-
 pub use crate::buffer::*;
 pub use crate::raw_pool_buf_io::*;
-
-#[metrics]
-pub mod buffer_pool {
-    /// Number of objects available for reuse in the pool.
-    pub fn pool_idle_count(name: &'static str) -> Gauge;
-    /// Memory footprint of objects currently in the pool.
-    pub fn pool_idle_bytes(name: &'static str) -> Gauge;
-    /// Number of objects currently active and in-use.
-    pub fn pool_active_count(name: &'static str) -> Gauge;
-    /// Total number of bytes allocated across all `ConsumeBuffer` objects.
-    ///
-    /// We're not able to track this with better granularity because
-    /// the ConsumeBuffers may be resized, and they don't know their pools.
-    pub fn consume_buffer_total_bytes() -> Gauge;
-}
 
 /// A sharded pool of elements.
 #[derive(Debug)]
@@ -76,18 +58,15 @@ struct QueueShard<T> {
     trim: usize,
     /// The max number of values to keep in the shard.
     max: usize,
-    /// Name of the pool, for metrics.
-    name: &'static str,
 }
 
 impl<T> QueueShard<T> {
-    const fn new(trim: usize, max: usize, name: &'static str) -> Self {
+    const fn new(trim: usize, max: usize) -> Self {
         QueueShard {
             queue: SegQueue::new(),
             elem_cnt: AtomicUsize::new(0),
             trim,
             max,
-            name,
         }
     }
 }
@@ -101,7 +80,6 @@ pub struct Pooled<T: Default + Reuse + 'static> {
 
 impl<T: Default + Reuse> Pooled<T> {
     fn new(inner: T, shard: &'static QueueShard<T>) -> Self {
-        buffer_pool::pool_active_count(shard.name).inc();
         Pooled { inner, pool: shard }
     }
 
@@ -117,25 +95,15 @@ impl<T: Default + Reuse> Drop for Pooled<T> {
             elem_cnt,
             trim,
             max,
-            name,
+            ..
         } = self.pool;
-        // The memory associated with this object is no longer live.
-        buffer_pool::pool_active_count(name).dec();
         if self.inner.reuse(*trim) {
             if elem_cnt.fetch_add(1, Ordering::Acquire) < *max {
-                // If returning the element to the queue would not exceed max
-                // number of elements, return it
-                buffer_pool::pool_idle_count(name).inc();
-                buffer_pool::pool_idle_bytes(name)
-                    .inc_by(self.inner.capacity() as u64);
                 queue.push(std::mem::take(&mut self.inner));
                 return;
             }
-            // There was no room for the buffer, return count to previous value
-            // and drop
             elem_cnt.fetch_sub(1, Ordering::Release);
         }
-        // If item did not qualify for return, drop it
     }
 }
 
@@ -146,10 +114,10 @@ macro_rules! array_impl_new_queues {
     {$n:expr, $t:ident $($ts:ident)*} => {
         impl<$t: Default + Reuse> Pool<{$n}, $t> {
             #[allow(dead_code)]
-            pub const fn new(limit: usize, trim: usize, name: &'static str) -> Self {
+            pub const fn new(limit: usize, trim: usize) -> Self {
                 let limit = limit / $n;
                 Pool {
-                    queues: [QueueShard::new(trim, limit, name), $(QueueShard::<$ts>::new(trim, limit, name)),*],
+                    queues: [QueueShard::new(trim, limit), $(QueueShard::<$ts>::new(trim, limit)),*],
                     next_shard: AtomicUsize::new(0),
                 }
             }
@@ -171,9 +139,6 @@ impl<const S: usize, T: Default + Reuse> Pool<S, T> {
         let inner = match shard.queue.pop() {
             Some(el) => {
                 shard.elem_cnt.fetch_sub(1, Ordering::Relaxed);
-                buffer_pool::pool_idle_count(shard.name).dec();
-                buffer_pool::pool_idle_bytes(shard.name)
-                    .dec_by(el.capacity() as u64);
                 el
             },
             None => Default::default(),
@@ -272,12 +237,10 @@ mod tests {
     fn test_sharding() {
         const SHARDS: usize = 3;
         const MAX_IN_SHARD: usize = 2;
-        const POOL_NAME: &str = "test_sharding_pool";
 
         let pool = Box::leak(Box::new(Pool::<SHARDS, Vec<u8>>::new(
             SHARDS * MAX_IN_SHARD,
             4,
-            POOL_NAME,
         )));
 
         let bufs = (0..SHARDS * 4).map(|_| pool.get()).collect::<Vec<_>>();
@@ -285,16 +248,9 @@ mod tests {
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), 0);
         }
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            bufs.len() as u64
-        );
 
         for (i, buf) in bufs.iter().enumerate() {
             assert!(buf.is_empty());
-            // Check the buffer is sharded properly.
             assert_eq!(
                 buf.pool as *const _,
                 &pool.queues[i % SHARDS] as *const _
@@ -305,19 +261,10 @@ mod tests {
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), 0);
         }
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            bufs.len() as u64
-        );
 
         // Now drop the buffers, they will not go into the pool because they have
-        // no capacity, so reuse returns false. What is the point in
-        // pooling empty buffers?
+        // no capacity, so reuse returns false.
         drop(bufs);
-        assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), 0);
 
         // Get buffers with capacity next.
         let bufs = (0..SHARDS * 4)
@@ -325,38 +272,24 @@ mod tests {
             .collect::<Vec<_>>();
 
         for (i, buf) in bufs.iter().enumerate() {
-            // Check the buffer is sharded properly.
             assert_eq!(
                 buf.pool as *const _,
                 &pool.queues[i % SHARDS] as *const _
             );
-            // Check that the buffer was properly extended
             assert_eq!(&buf[..], &[0, 1]);
         }
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            bufs.len() as u64
-        );
 
         drop(bufs);
 
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), MAX_IN_SHARD);
         }
-        assert_eq!(
-            buffer_pool::pool_idle_count(POOL_NAME).get(),
-            (SHARDS * MAX_IN_SHARD) as u64
-        );
-        assert_ne!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 0);
 
         // Now get buffers again, this time they should come from the pool.
         let bufs = (0..SHARDS).map(|_| pool.get()).collect::<Vec<_>>();
 
         for (i, buf) in bufs.iter().enumerate() {
-            // Check that the buffer was properly cleared.
             assert!(buf.is_empty());
-            // Check the buffer is sharded properly.
             assert_eq!(
                 buf.pool as *const _,
                 &pool.queues[i % SHARDS] as *const _
@@ -366,104 +299,52 @@ mod tests {
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), 1);
         }
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), SHARDS as u64);
-        assert_ne!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            bufs.len() as u64
-        );
 
         // Get more buffers from the pool.
         let bufs2 = (0..SHARDS).map(|_| pool.get()).collect::<Vec<_>>();
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), 0);
         }
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            (bufs.len() + bufs2.len()) as u64
-        );
 
         // Get even more buffers.
         let bufs3 = (0..SHARDS).map(|_| pool.get()).collect::<Vec<_>>();
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), 0);
         }
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            (bufs.len() + bufs2.len() + bufs3.len()) as u64
-        );
 
         // Now begin dropping.
         drop(bufs);
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), 1);
         }
-        assert_eq!(buffer_pool::pool_idle_count(POOL_NAME).get(), SHARDS as u64);
-        assert_ne!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            (bufs2.len() + bufs3.len()) as u64
-        );
 
         drop(bufs2);
         for shard in pool.queues.iter() {
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), MAX_IN_SHARD);
         }
-        assert_eq!(
-            buffer_pool::pool_idle_count(POOL_NAME).get(),
-            (SHARDS * MAX_IN_SHARD) as u64
-        );
-        assert_ne!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(
-            buffer_pool::pool_active_count(POOL_NAME).get(),
-            bufs3.len() as u64
-        );
 
         drop(bufs3);
         for shard in pool.queues.iter() {
             // Can't get over limit.
             assert_eq!(shard.elem_cnt.load(Ordering::Relaxed), MAX_IN_SHARD);
         }
-        assert_eq!(
-            buffer_pool::pool_idle_count(POOL_NAME).get(),
-            (SHARDS * MAX_IN_SHARD) as u64
-        );
-        assert_ne!(buffer_pool::pool_idle_bytes(POOL_NAME).get(), 0);
-        assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 0);
     }
 
     #[test]
     fn test_creation() {
         const SHARDS: usize = 3;
         const MAX_IN_SHARD: usize = 2;
-        const POOL_NAME: &str = "test_creation_pool";
 
         let pool = Box::leak(Box::new(Pool::<SHARDS, Vec<u8>>::new(
             SHARDS * MAX_IN_SHARD,
             4,
-            POOL_NAME,
         )));
-
-        assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 0);
 
         {
             let _buf1 = pool.get();
-            assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 1);
-
             let _buf2 = pool.get_empty();
-            assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 2);
-
             let _buf3 = pool.get_with(|_| ());
-            assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 3);
-
             let _buf4 = pool.from_owned(vec![0, 1, 2, 4]);
-            assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 4);
         }
-
-        assert_eq!(buffer_pool::pool_active_count(POOL_NAME).get(), 0);
     }
 }
