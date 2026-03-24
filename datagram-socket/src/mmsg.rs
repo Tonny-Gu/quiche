@@ -64,10 +64,10 @@ pub fn recvmmsg(fd: BorrowedFd, bufs: &mut [ReadBuf<'_>]) -> io::Result<usize> {
             hdr.msg_control = std::ptr::null_mut();
             hdr.msg_controllen = 0;
             hdr.msg_flags = 0;
-            msgvec.push(libc::mmsghdr {
-                msg_hdr: hdr,
-                msg_len: buf.capacity().try_into().unwrap(),
-            });
+            let mut mhdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            mhdr.msg_hdr = hdr;
+            mhdr.msg_len = buf.capacity().try_into().unwrap();
+            msgvec.push(mhdr);
         }
 
         let result = unsafe {
@@ -125,10 +125,10 @@ pub fn sendmmsg(fd: BorrowedFd, bufs: &[ReadBuf<'_>]) -> io::Result<usize> {
             hdr.msg_control = std::ptr::null_mut();
             hdr.msg_controllen = 0;
             hdr.msg_flags = 0;
-            msgvec.push(libc::mmsghdr {
-                msg_hdr: hdr,
-                msg_len: buf.capacity().try_into().unwrap(),
-            });
+            let mut mhdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            mhdr.msg_hdr = hdr;
+            mhdr.msg_len = buf.capacity().try_into().unwrap();
+            msgvec.push(mhdr);
         }
 
         let result = unsafe {
