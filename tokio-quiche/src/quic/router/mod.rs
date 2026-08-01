@@ -198,9 +198,8 @@ where
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
         let accept_sink_clone = accept_sink.clone();
-        let accept_closed = Box::pin(
-            async move { accept_sink_clone.closed().await }.fuse(),
-        );
+        let accept_closed =
+            Box::pin(async move { accept_sink_clone.closed().await }.fuse());
         let (conn_map_cmd_tx, conn_map_cmd_rx) = mpsc::unbounded_channel();
 
         (

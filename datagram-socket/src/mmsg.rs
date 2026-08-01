@@ -55,7 +55,8 @@ pub fn recvmmsg(fd: BorrowedFd, bufs: &mut [ReadBuf<'_>]) -> io::Result<usize> {
 
             slices.push(IoSlice::new(b));
 
-            // Use mem::zeroed() for musl compatibility (msghdr has private padding fields)
+            // Use mem::zeroed() for musl compatibility (msghdr has private
+            // padding fields)
             let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
             hdr.msg_name = std::ptr::null_mut();
             hdr.msg_namelen = 0;
@@ -116,7 +117,8 @@ pub fn sendmmsg(fd: BorrowedFd, bufs: &[ReadBuf<'_>]) -> io::Result<usize> {
         for buf in bufs.iter() {
             slices.push(IoSlice::new(buf.filled()));
 
-            // Use mem::zeroed() for musl compatibility (msghdr has private padding fields)
+            // Use mem::zeroed() for musl compatibility (msghdr has private
+            // padding fields)
             let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
             hdr.msg_name = std::ptr::null_mut();
             hdr.msg_namelen = 0;

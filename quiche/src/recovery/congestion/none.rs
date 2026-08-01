@@ -84,9 +84,7 @@ fn state_str(_r: &Congestion, _now: Instant) -> &'static str {
     "none"
 }
 
-fn debug_fmt(
-    _r: &Congestion, f: &mut std::fmt::Formatter,
-) -> std::fmt::Result {
+fn debug_fmt(_r: &Congestion, f: &mut std::fmt::Formatter) -> std::fmt::Result {
     write!(f, "none")
 }
 
