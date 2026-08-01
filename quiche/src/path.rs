@@ -185,6 +185,9 @@ pub struct Path {
     /// Number of DATAGRAM frames sent on this path.
     pub dgram_sent_count: usize,
 
+    /// Number of DATAGRAM frames marked lost on this path.
+    pub dgram_lost_count: usize,
+
     /// Number of DATAGRAM frames received on this path.
     pub dgram_recv_count: usize,
 
@@ -276,6 +279,7 @@ impl Path {
             retrans_count: 0,
             total_pto_count: 0,
             dgram_sent_count: 0,
+            dgram_lost_count: 0,
             dgram_recv_count: 0,
             sent_bytes: 0,
             recv_bytes: 0,
@@ -559,6 +563,7 @@ impl Path {
             total_pto_count: self.total_pto_count,
             dgram_recv: self.dgram_recv_count,
             dgram_sent: self.dgram_sent_count,
+            dgram_lost: self.dgram_lost_count,
             rtt: self.recovery.rtt(),
             min_rtt: self.recovery.min_rtt(),
             max_rtt: self.recovery.max_rtt(),
@@ -574,6 +579,7 @@ impl Path {
                 .recovery
                 .max_bandwidth()
                 .map(Bandwidth::to_bytes_per_second),
+            rtt_persistent_jump_count: self.recovery.rtt_persistent_jump_count(),
             startup_exit: self.recovery.startup_exit(),
         }
     }
@@ -925,6 +931,7 @@ impl PathMap {
 ///
 /// [`path_stats()`]: struct.Connection.html#method.path_stats
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct PathStats {
     /// The local address of the path.
     pub local_addr: SocketAddr,
@@ -963,6 +970,9 @@ pub struct PathStats {
 
     /// The number of DATAGRAM frames sent.
     pub dgram_sent: usize,
+
+    /// The number of DATAGRAM frames lost.
+    pub dgram_lost: usize,
 
     /// The estimated round-trip time of the connection.
     pub rtt: Duration,
@@ -1011,6 +1021,9 @@ pub struct PathStats {
     /// it is currently only implemented for bbr2_gcongestion.
     pub max_bandwidth: Option<u64>,
 
+    /// The total number of confirmed persistent RTT jump episodes.
+    pub rtt_persistent_jump_count: u64,
+
     /// Statistics from when a CCA first exited the startup phase.
     pub startup_exit: Option<StartupExit>,
 }
@@ -1042,8 +1055,11 @@ impl std::fmt::Debug for PathStats {
 
         write!(
             f,
-            " stream_retrans_bytes={} pmtu={} delivery_rate={}",
-            self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
+            " stream_retrans_bytes={} pmtu={} delivery_rate={} rtt_persistent_jump_count={}",
+            self.stream_retrans_bytes,
+            self.pmtu,
+            self.delivery_rate,
+            self.rtt_persistent_jump_count,
         )
     }
 }

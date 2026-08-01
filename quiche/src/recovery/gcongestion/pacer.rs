@@ -161,7 +161,7 @@ impl Pacer {
         // packet.
         let delay = self
             .pacing_rate(bytes_in_flight + bytes, rtt_stats)
-            .transfer_time(bytes);
+            .transfer_time(bytes as u64);
 
         if !self.pacing_limited || self.lumpy_tokens == 0 {
             // Reset lumpy_tokens_ if either application or cwnd throttles sending
@@ -256,6 +256,10 @@ impl Pacer {
 
     pub fn max_bandwidth(&self) -> Bandwidth {
         self.sender.max_bandwidth()
+    }
+
+    pub fn rtt_persistent_jump_count(&self) -> u64 {
+        self.sender.rtt_persistent_jump_count()
     }
 
     #[cfg(feature = "qlog")]

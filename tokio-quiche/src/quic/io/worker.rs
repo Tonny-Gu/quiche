@@ -77,6 +77,163 @@ const RELEASE_TIMER_THRESHOLD: Duration = Duration::from_micros(250);
 /// Stop queuing GSO packets, if packet size is below this threshold.
 const GSO_THRESHOLD: usize = 1_000;
 
+/// Size of each full egress buffer borrowed for a send burst.
+///
+/// Matches the maximum quiche buffer size so GSO batching is unaffected while
+/// a connection is actively sending. Unlike a persistent per-connection
+/// buffer, this memory is returned to the per-worker [`SEND_BUF_POOL`] before
+/// the worker sleeps. The free list retains it for reuse (rather than truly
+/// freeing it) but no idle connection owns an egress buffer.
+const SEND_BUFFER_SIZE: usize = crate::buf_factory::BufFactory::MAX_BUF_SIZE;
+
+/// Size of a temporary egress buffer when pooling is disabled.
+///
+/// The cold handshake and connection-close paths generate a single datagram at
+/// a time. When pooling is enabled, they borrow a full-size buffer from
+/// [`SEND_BUF_POOL`]; otherwise a one-MTU buffer is enough.
+const TRANSIENT_SEND_BUFFER_SIZE: usize = 1500;
+
+/// Allocates a zero-initialized egress buffer on the heap.
+///
+/// This is the cold path that fills [`SEND_BUF_POOL`] on a miss; steady-state
+/// bursts borrow a recycled buffer via [`PooledSendBuf::acquire`] and never
+/// hit this. The buffer is boxed (never a stack array) so that holding it
+/// across the `.await` in [`IoWorker::flush_buffer_to_socket`] keeps the
+/// worker's futures small and avoids uncontrolled stack growth.
+fn alloc_send_buffer() -> Box<[u8]> {
+    vec![0u8; SEND_BUFFER_SIZE].into_boxed_slice()
+}
+
+thread_local! {
+    /// Per-runtime-worker free-list of egress scratch buffers.
+    ///
+    /// A buffer is borrowed for a single send burst and returned on drop, so
+    /// its pages stay resident across bursts (no per-burst page fault or
+    /// kernel zero-fill) while no idle connection retains a buffer: the pool
+    /// holds at most [`SEND_BUF_POOL_CAP`] buffers per worker thread,
+    /// independent of the connection count.
+    static SEND_BUF_POOL: std::cell::RefCell<Vec<Box<[u8]>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Upper bound on egress buffers parked per worker thread. The natural
+/// high-water mark is the number of connection tasks simultaneously suspended
+/// at a flush `.await` on one runtime thread; returns beyond the cap are freed
+/// so a burst spike cannot pin unbounded memory to a thread.
+///
+/// This is a fixed per-worker-thread reservation, independent of the
+/// connection count: up to `SEND_BUF_POOL_CAP * SEND_BUFFER_SIZE`
+/// (16 * 64 KiB = 1 MiB) per runtime worker thread. The pool is not shrunk
+/// once grown, so after a burst it stays at its high-water mark for the
+/// process lifetime.
+const SEND_BUF_POOL_CAP: usize = 16;
+
+/// Egress scratch buffer borrowed from the per-thread [`SEND_BUF_POOL`] and
+/// returned to it on drop.
+///
+/// Behaves like the `Box<[u8]>` it replaces via `Deref`/`DerefMut`, so idle
+/// connections still retain no egress buffer, but the backing pages are
+/// recycled instead of re-faulted (and re-zeroed by the kernel) every burst.
+struct PooledSendBuf(Box<[u8]>);
+
+impl PooledSendBuf {
+    fn acquire() -> Self {
+        let buf = SEND_BUF_POOL
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| {
+                // Pool miss (cold path): allocate a fresh buffer and record it.
+                // Re-using a parked buffer (the hot path) does not touch any
+                // counter.
+                crate::metrics::quic::send_buffer_pool_allocated().inc();
+                alloc_send_buffer()
+            });
+        // No re-zeroing on reuse: quiche writes only the bytes it emits and
+        // the flush path transmits solely `send_buf[..bytes_written]`, so any
+        // stale bytes left by a previous burst are never sent.
+        Self(buf)
+    }
+}
+
+impl Drop for PooledSendBuf {
+    fn drop(&mut self) {
+        // Move the buffer out, leaving an empty (non-allocating) boxed slice
+        // behind, so it can be returned to the pool. Storing a plain
+        // `Box<[u8]>` rather than an `Option` keeps `Deref`/`DerefMut`
+        // panic-free.
+        let buf = std::mem::take(&mut self.0);
+        // Returns to *this* thread's pool. With tokio work-stealing a task may
+        // migrate across the flush `.await`, so a buffer can be acquired on one
+        // worker and returned on another; this is benign, and the per-thread
+        // cap keeps the total bounded by `cap * workers`.
+        SEND_BUF_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < SEND_BUF_POOL_CAP {
+                pool.push(buf);
+            } else {
+                // Pool already at capacity (cold path, only under burst
+                // spikes): drop the buffer instead of parking it, and record
+                // the discard. Returning to a non-full pool (the hot path)
+                // does not touch any counter.
+                crate::metrics::quic::send_buffer_pool_discarded().inc();
+            }
+        });
+    }
+}
+
+impl std::ops::Deref for PooledSendBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for PooledSendBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
+
+/// Egress buffer used briefly outside the main write loop.
+///
+/// This preserves the runtime pooling switch for handshake and close paths:
+/// pooling borrows a full-size recycled buffer, while disabling it allocates a
+/// small one-off buffer.
+enum TransientSendBuf {
+    Pooled(PooledSendBuf),
+    Unpooled(Box<[u8]>),
+}
+
+impl TransientSendBuf {
+    fn acquire(pool_send_buffer: bool) -> Self {
+        if pool_send_buffer {
+            Self::Pooled(PooledSendBuf::acquire())
+        } else {
+            Self::Unpooled(
+                vec![0u8; TRANSIENT_SEND_BUFFER_SIZE].into_boxed_slice(),
+            )
+        }
+    }
+}
+
+impl AsRef<[u8]> for TransientSendBuf {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Pooled(buf) => &buf[..],
+            Self::Unpooled(buf) => &buf[..],
+        }
+    }
+}
+
+impl AsMut<[u8]> for TransientSendBuf {
+    fn as_mut(&mut self) -> &mut [u8] {
+        match self {
+            Self::Pooled(buf) => &mut buf[..],
+            Self::Unpooled(buf) => &mut buf[..],
+        }
+    }
+}
+
 pub struct WriterConfig {
     pub pending_cid: Option<ConnectionId<'static>>,
     pub peer_addr: SocketAddr,
@@ -84,6 +241,10 @@ pub struct WriterConfig {
     pub with_gso: bool,
     pub pacing_offload: bool,
     pub with_pktinfo: bool,
+    /// Whether the worker borrows its egress buffer from a per-worker-thread
+    /// pool for each send burst. When `false`, the worker keeps a persistent
+    /// per-connection buffer for its lifetime instead.
+    pub pool_send_buffer: bool,
 }
 
 #[derive(Default)]
@@ -222,10 +383,25 @@ where
         let sleep = time::sleep(DEFAULT_SLEEP);
         tokio::pin!(sleep);
 
+        // When pooling is disabled we keep one persistent egress buffer for the
+        // whole connection, owned here in the IO worker and held across the loop
+        // below (including while the connection is idle) -- the pre-pooling
+        // behavior. When pooling is enabled this stays `None` and each send
+        // burst borrows a transient buffer from the per-worker pool instead.
+        let mut persistent_send_buf: Option<Box<[u8]>> =
+            (!self.cfg.pool_send_buffer).then(alloc_send_buffer);
+
         loop {
             let now = Instant::now();
 
             self.write_state.has_pending_data = true;
+
+            // Transient egress buffer for this wakeup's send burst when pooling
+            // is enabled. Borrowed from the per-worker pool on demand (see
+            // below) and returned after the burst, before the worker sleeps in
+            // the `select!` further down, so idle connections still hold no
+            // egress buffer. Stays `None` when a persistent buffer is used.
+            let mut pooled_send_buf: Option<PooledSendBuf> = None;
 
             while self.write_state.has_pending_data {
                 let mut packets_sent = 0;
@@ -261,7 +437,21 @@ where
                 while self.write_state.has_pending_data &&
                     packets_sent < CHECK_INCOMING_QUEUE_RATIO
                 {
-                    self.gather_data_from_quiche_conn(qconn, ctx.buffer())?;
+                    // Use the persistent per-connection buffer when pooling is
+                    // disabled. Otherwise borrow a buffer from the per-worker
+                    // pool on the first gather of this send burst and reuse it
+                    // for the remainder of the burst; it is returned at the end
+                    // of the enclosing block (below), before the worker sleeps,
+                    // so idle connections hold no egress buffer.
+                    let send_buf: &mut [u8] =
+                        if let Some(buf) = persistent_send_buf.as_deref_mut() {
+                            buf
+                        } else {
+                            &mut pooled_send_buf
+                                .get_or_insert_with(PooledSendBuf::acquire)[..]
+                        };
+
+                    self.gather_data_from_quiche_conn(qconn, send_buf, false)?;
 
                     // Break if the connection is closed
                     if qconn.is_closed() {
@@ -271,7 +461,7 @@ where
                     let mut flush_operation_token =
                         TrackMidHandshakeFlush::new(self.metrics.clone());
 
-                    self.flush_buffer_to_socket(ctx.buffer()).await;
+                    self.flush_buffer_to_socket(&send_buf[..]).await;
 
                     flush_operation_token.mark_complete();
 
@@ -284,6 +474,12 @@ where
                     }
                 }
             }
+
+            // Return the borrowed egress buffer to the per-worker pool before
+            // sleeping so it is not held while the connection is idle. The
+            // persistent buffer (when pooling is disabled) is intentionally
+            // kept across sleeps for the connection's lifetime.
+            drop(pooled_send_buf);
 
             self.bw_estimator.update(qconn, now);
 
@@ -310,6 +506,7 @@ where
 
             let incoming_recv = &mut ctx.incoming_pkt_receiver;
             let application = &mut ctx.application;
+
             select! {
                 biased;
                 () = &mut sleep => {
@@ -326,10 +523,18 @@ where
                     sleep.as_mut().reset((now + DEFAULT_SLEEP).into());
                 }
                 Some(pkt) = incoming_recv.recv() => ctx.in_pkt = Some(pkt),
-                // TODO(erittenhouse): would be nice to decouple wait_for_data from the
-                // application, but wait_for_quiche relies on IOW methods, so we can't write a
-                // default implementation for ConnectionStage
-                status = self.wait_for_data_or_handshake(qconn, application) => status?,
+                directive = self.wait_for_data_or_handshake(qconn, application) => {
+                    match directive? {
+                        WaitForDataOrHandshakeDirective::Flush(send_buf) => {
+                            // The handshake data was gathered into this
+                            // on-demand buffer; flush it here (outside the
+                            // select! so the flush cannot be cancelled), then
+                            // return it to the pool or drop it.
+                            self.flush_buffer_to_socket(send_buf.as_ref()).await;
+                        }
+                        WaitForDataOrHandshakeDirective::Noop => {}
+                    }
+                },
             };
 
             if let ControlFlow::Break(reason) = self.conn_stage.post_wait(qconn) {
@@ -351,8 +556,13 @@ where
         }
     }
 
+    /// Gathers one or more packets from quiche into `send_buf`.
+    ///
+    /// A single-packet gather leaves a full buffer available for the next
+    /// packet instead of generating a short packet in the remaining tail.
     fn gather_data_from_quiche_conn(
         &mut self, qconn: &mut QuicheConnection, send_buf: &mut [u8],
+        single_packet: bool,
     ) -> QuicResult<usize> {
         let mut segment_size = None;
         let mut send_info = None;
@@ -414,9 +624,9 @@ where
                 Err(e) => break Err(e),
             };
 
-            // Flush to network after generating a single packet when GSO
-            // is disabled.
-            if !self.cfg.with_gso {
+            // Flush after one packet when GSO is disabled or the caller needs
+            // each packet to start with a full buffer.
+            if single_packet || !self.cfg.with_gso {
                 break outcome;
             }
 
@@ -689,12 +899,27 @@ where
         Ok(())
     }
 
-    /// When a connection is established, process application data, if not the
-    /// task is probably polled following a wakeup from boring, so we check
-    /// if quiche has any handshake packets to send.
+    // When a connection is established, process application data, if not the task
+    // is probably polled following a wakeup from boring, so we check if quiche
+    // has any handshake packets to send.
+    //
+    // TODO(erittenhouse): would be nice to decouple wait_for_data from the
+    // application, but wait_for_quiche relies on IOW methods, so we can't write a
+    // default implementation for ConnectionStage
+    //
+    // # Cancel safety
+    //
+    // This future is polled as an arm of the `select!` in [`Self::work_loop`],
+    // so it MUST be cancel safe: it may be dropped at any `.await` point when
+    // another arm completes first. It stays cancel safe because
+    // [`ApplicationOverQuic::wait_for_data`] is itself required to be cancel
+    // safe, and the handshake branch keeps no state across its `.await` beyond
+    // the local `send_buf` (which is returned to the free list or freed if the
+    // future is cancelled; any bytes gathered into it are re-gathered on the
+    // next poll). Take care to preserve this property when modifying it.
     async fn wait_for_data_or_handshake<A: ApplicationOverQuic>(
         &mut self, qconn: &mut QuicheConnection, quic_application: &mut A,
-    ) -> QuicResult<()> {
+    ) -> QuicResult<WaitForDataOrHandshakeDirective> {
         if quic_application.should_act() {
             // Poll the application to make progress.
             //
@@ -705,14 +930,22 @@ where
             // still in progress but we have 0-RTT keys to process early data.
             // This means TLS callbacks might only be polled on the next timeout
             // or when a packet is received from the peer.
-            quic_application.wait_for_data(qconn).await
+            quic_application.wait_for_data(qconn).await?;
+            Ok(WaitForDataOrHandshakeDirective::Noop)
         } else {
-            // Poll quiche to make progress on handshake callbacks.
-            self.wait_for_quiche(qconn, quic_application).await
+            // Poll quiche to make progress on handshake callbacks, gathering
+            // any handshake packets into an on-demand buffer that the caller
+            // flushes. `wait_for_quiche()` returns it only after generating a
+            // packet, so pending handshake waits do not retain a buffer.
+            let send_buf = self.wait_for_quiche(qconn).await?;
+            Ok(WaitForDataOrHandshakeDirective::Flush(send_buf))
         }
     }
 
-    /// Check if Quiche has any packets to send and flush them to socket.
+    /// Check if Quiche has any packets to send
+    ///
+    /// If yes: fills buffer and updates self.write_state.bytes_written
+    /// If no: Poll::Pending
     ///
     /// # Example
     ///
@@ -720,12 +953,30 @@ where
     /// handshake. Each call to `gather_data_from_quiche_conn` attempts to
     /// progress the handshake via a call to `quiche::Connection.send()` -
     /// once one of the `gather_data_from_quiche_conn()` calls writes to the
-    /// send buffer, we flush it to the network socket.
-    async fn wait_for_quiche<App: ApplicationOverQuic>(
-        &mut self, qconn: &mut QuicheConnection, app: &mut App,
-    ) -> QuicResult<()> {
-        let populate_send_buf = std::future::poll_fn(|_| {
-            match self.gather_data_from_quiche_conn(qconn, app.buffer()) {
+    /// send buffer, we signal to the caller which has to take care of flushing
+    ///
+    /// # Cancel safety
+    ///
+    /// This future is awaited (indirectly) as an arm of the `select!` in
+    /// [`Self::work_loop`], so it MUST be cancel safe. The `poll_fn` below
+    /// holds no state across polls other than what lives in `self.write_state`,
+    /// so dropping the future between polls loses nothing: the next call simply
+    /// re-gathers. Take care to preserve this property when modifying it.
+    async fn wait_for_quiche(
+        &mut self, qconn: &mut QuicheConnection,
+    ) -> QuicResult<TransientSendBuf> {
+        let send_buf = std::future::poll_fn(|_| {
+            // Allocate inside this closure so a pending poll immediately
+            // returns its buffer to the pool instead of retaining it across
+            // the select! wait.
+            let mut send_buf =
+                TransientSendBuf::acquire(self.cfg.pool_send_buffer);
+
+            match self.gather_data_from_quiche_conn(
+                qconn,
+                send_buf.as_mut(),
+                true,
+            ) {
                 Ok(bytes_written) => {
                     // We need to avoid consecutive calls to gather(), which write
                     // data to the buffer, without a flush().
@@ -736,33 +987,39 @@ where
                     if bytes_written == 0 && self.write_state.bytes_written == 0 {
                         Poll::Pending
                     } else {
-                        Poll::Ready(Ok(()))
+                        Poll::Ready(Ok(send_buf))
                     }
                 },
                 _ => Poll::Ready(Err(quiche::Error::TlsFail)),
             }
         })
-        .await;
-
-        if populate_send_buf.is_err() {
-            return Err(Box::new(quiche::Error::TlsFail));
-        }
-
-        self.flush_buffer_to_socket(app.buffer()).await;
-
-        Ok(())
+        .await?;
+        Ok(send_buf)
     }
+}
+
+/// Whether caller of [`wait_for_data_or_handshake`] is required to
+/// call [`flush_buffer_to_socket`].
+///
+/// `Flush` carries the on-demand buffer the handshake data was gathered into so
+/// the caller can flush it and then return it to the pool or drop it.
+#[must_use]
+enum WaitForDataOrHandshakeDirective {
+    Noop,
+    Flush(TransientSendBuf),
 }
 
 pub struct Running<Tx, M, A> {
     pub(crate) params: IoWorkerParams<Tx, M>,
     pub(crate) context: ConnectionStageContext<A>,
-    pub(crate) qconn: QuicheConnection,
+    /// See [`QuicConnectionParams::quiche_conn`].
+    pub(crate) qconn: Box<QuicheConnection>,
 }
 
 impl<Tx, M, A> Running<Tx, M, A> {
     pub fn ssl(&mut self) -> &mut SslRef {
-        self.qconn.as_mut()
+        // Deref to pick `Connection::as_mut` over `Box::as_mut`.
+        (*self.qconn).as_mut()
     }
 }
 
@@ -770,7 +1027,8 @@ pub(crate) struct Closing<Tx, M, A> {
     pub(crate) params: IoWorkerParams<Tx, M>,
     pub(crate) context: ConnectionStageContext<A>,
     pub(crate) work_loop_result: QuicResult<()>,
-    pub(crate) qconn: QuicheConnection,
+    /// See [`QuicConnectionParams::quiche_conn`].
+    pub(crate) qconn: Box<QuicheConnection>,
 }
 
 pub enum RunningOrClosing<Tx, M, A> {
@@ -784,7 +1042,8 @@ where
     M: Metrics,
 {
     pub(crate) async fn run<A>(
-        mut self, mut qconn: QuicheConnection, mut ctx: ConnectionStageContext<A>,
+        mut self, mut qconn: Box<QuicheConnection>,
+        mut ctx: ConnectionStageContext<A>,
     ) -> RunningOrClosing<Tx, M, A>
     where
         A: ApplicationOverQuic,
@@ -795,7 +1054,8 @@ where
         // cause issues as this waker will then be stale and attempt to
         // wake the wrong task.
         std::future::poll_fn(|cx| {
-            let ssl = qconn.as_mut();
+            // Deref to pick `Connection::as_mut` over `Box::as_mut`.
+            let ssl = (*qconn).as_mut();
             ssl.set_task_waker(Some(cx.waker().clone()));
 
             Poll::Ready(())
@@ -892,7 +1152,8 @@ where
     M: Metrics,
 {
     pub(crate) async fn run<A: ApplicationOverQuic>(
-        mut self, mut qconn: QuicheConnection, mut ctx: ConnectionStageContext<A>,
+        mut self, mut qconn: Box<QuicheConnection>,
+        mut ctx: ConnectionStageContext<A>,
     ) -> Closing<Tx, M, A> {
         // Perform a single call to process_reads()/process_writes(),
         // unconditionally, to ensure that any application data (e.g.
@@ -953,8 +1214,13 @@ where
         // send (ignoring flow/congestion control constraints). We should
         // guarantee that it gets sent by doublechecking the
         // gathered/flushed byte totals and retry if they don't match.
-        let _ = self.gather_data_from_quiche_conn(qconn, ctx.buffer());
-        self.flush_buffer_to_socket(ctx.buffer()).await;
+        //
+        // This runs once per connection at close and sends a single
+        // CONNECTION_CLOSE datagram, so acquire a buffer only for this send.
+        let mut send_buf = TransientSendBuf::acquire(self.cfg.pool_send_buffer);
+        let _ =
+            self.gather_data_from_quiche_conn(qconn, send_buf.as_mut(), false);
+        self.flush_buffer_to_socket(send_buf.as_ref()).await;
 
         *ctx.stats.lock().unwrap() = QuicConnectionStats::from_conn(qconn);
 
@@ -967,6 +1233,20 @@ where
             } else {
                 self.audit_log_stats
                     .set_recvd_conn_close_transport_error_code(
+                        err.error_code as _,
+                    );
+            }
+        }
+
+        if let Some(err) = qconn.local_error() {
+            if err.is_app {
+                self.audit_log_stats
+                    .set_sent_conn_close_application_error_code(
+                        err.error_code as _,
+                    );
+            } else {
+                self.audit_log_stats
+                    .set_sent_conn_close_transport_error_code(
                         err.error_code as _,
                     );
             }
@@ -1036,4 +1316,67 @@ fn random_u128() -> u128 {
     let mut buf = [0; 16];
     boring::rand::rand_bytes(&mut buf).expect("boring's RAND_bytes never fails");
     u128::from_ne_bytes(buf)
+}
+
+#[cfg(test)]
+mod pooled_send_buf_tests {
+    use super::*;
+
+    // Each test runs on a freshly spawned thread so the thread-local
+    // `SEND_BUF_POOL` starts empty (const-initialized) and cannot interfere
+    // with other tests sharing the harness's worker threads.
+
+    #[test]
+    fn caps_retained_buffers() {
+        std::thread::spawn(|| {
+            // Acquire more than the cap at once (all misses, so all fresh
+            // allocations), then drop them. Only `SEND_BUF_POOL_CAP` may be
+            // parked; the remainder are freed.
+            let bufs: Vec<PooledSendBuf> = (0..SEND_BUF_POOL_CAP + 4)
+                .map(|_| PooledSendBuf::acquire())
+                .collect();
+            drop(bufs);
+
+            let retained = SEND_BUF_POOL.with(|pool| pool.borrow().len());
+            assert_eq!(retained, SEND_BUF_POOL_CAP);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn reuses_a_returned_buffer() {
+        std::thread::spawn(|| {
+            let first_ptr = {
+                let buf = PooledSendBuf::acquire();
+                assert_eq!(buf.len(), SEND_BUFFER_SIZE);
+                buf.as_ptr()
+            }; // returned to the pool here
+
+            let reused = PooledSendBuf::acquire();
+            assert_eq!(
+                reused.as_ptr(),
+                first_ptr,
+                "acquire should hand back the pooled allocation"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn returns_to_the_dropping_thread() {
+        // Acquire on one thread, drop on another: the buffer lands in the
+        // dropping thread's pool (work-stealing migration across `.await` is
+        // benign).
+        let buf = std::thread::spawn(PooledSendBuf::acquire).join().unwrap();
+
+        std::thread::spawn(move || {
+            assert_eq!(SEND_BUF_POOL.with(|pool| pool.borrow().len()), 0);
+            drop(buf);
+            assert_eq!(SEND_BUF_POOL.with(|pool| pool.borrow().len()), 1);
+        })
+        .join()
+        .unwrap();
+    }
 }

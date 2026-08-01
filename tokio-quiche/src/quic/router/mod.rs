@@ -34,8 +34,6 @@ use super::connection::InitialQuicConnection;
 use super::connection::QuicConnectionParams;
 use super::io::worker::WriterConfig;
 use super::QuicheConnection;
-use crate::buf_factory::BufFactory;
-use crate::buf_factory::PooledBuf;
 use crate::metrics::labels;
 use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
@@ -44,12 +42,12 @@ use crate::settings::Config;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
 use foundations::telemetry::log;
+use futures::future::FusedFuture;
+use futures::FutureExt;
 use quiche::ConnectionId;
 use quiche::Header;
 use quiche::MAX_CONN_ID_LEN;
 use std::default::Default;
-use futures::future::FusedFuture;
-use futures::FutureExt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -73,6 +71,13 @@ use libc::sockaddr_in;
 use libc::sockaddr_in6;
 
 type ConnStream<Tx, M> = mpsc::Receiver<io::Result<InitialQuicConnection<Tx, M>>>;
+
+/// How many incoming packets (GRO batches) to process before checking the
+/// `ConnectionMapCommand` queue again. 30 means "check the command queue once
+/// every 30 packets".
+const PACKET_RX_YIELD_AFTER: usize = 30;
+/// `ConnectionMapCommand` processing batch size to amortize receive operations.
+const CONN_MAP_CMD_BATCH_SIZE: usize = 128;
 
 #[cfg(feature = "perf-quic-listener-metrics")]
 mod listener_stage_timer {
@@ -102,7 +107,7 @@ mod listener_stage_timer {
 
 #[derive(Debug)]
 struct PollRecvData {
-    bytes: usize,
+    buf: Vec<u8>,
     // The packet's source, e.g., the peer's address
     src_addr: SocketAddr,
     // The packet's original destination. If the original destination is
@@ -126,7 +131,8 @@ pub enum ConnectionMapCommand {
 
 /// An `InboundPacketRouter` maintains a map of quic connections and routes
 /// [`Incoming`] packets from the [recv half][rh] of a datagram socket to those
-/// connections or some quic initials handler.
+/// connections or some quic initials handler. There is only 1
+/// `InboundPacketRouter` per socket.
 ///
 /// [rh]: datagram_socket::DatagramSocketRecv
 ///
@@ -153,6 +159,10 @@ where
     shutdown_rx: mpsc::Receiver<()>,
     conn_map_cmd_tx: mpsc::UnboundedSender<ConnectionMapCommand>,
     conn_map_cmd_rx: mpsc::UnboundedReceiver<ConnectionMapCommand>,
+    /// Reusable buffer to receive a batch of `ConnectionMapCommand`s in
+    /// `poll_conn_map_commands`. Always fully drained after use, so its length
+    /// should be 0 outside of `poll_conn_map_commands`.
+    conn_map_cmd_buf: Vec<ConnectionMapCommand>,
     accept_sink: mpsc::Sender<io::Result<InitialQuicConnection<Tx, M>>>,
     /// Waker future that completes when the accept stream receiver is dropped.
     /// Polling this registers a waker so the Router task is notified promptly.
@@ -164,7 +174,8 @@ where
     #[cfg(target_os = "linux")]
     reusable_cmsg_space: Vec<u8>,
 
-    current_buf: PooledBuf,
+    #[cfg(target_os = "linux")]
+    buf: Vec<u8>,
 
     // We keep the metrics in here, to avoid cloning them each packet
     #[cfg(target_os = "linux")]
@@ -187,9 +198,9 @@ where
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (accept_sink, accept_stream) = mpsc::channel(config.listen_backlog);
         let accept_sink_clone = accept_sink.clone();
-        let accept_closed = Box::pin(async move {
-            accept_sink_clone.closed().await
-        }.fuse());
+        let accept_closed = Box::pin(
+            async move { accept_sink_clone.closed().await }.fuse(),
+        );
         let (conn_map_cmd_tx, conn_map_cmd_rx) = mpsc::unbounded_channel();
 
         (
@@ -203,6 +214,7 @@ where
                 shutdown_rx,
                 conn_map_cmd_tx,
                 conn_map_cmd_rx,
+                conn_map_cmd_buf: Vec::with_capacity(4),
                 accept_sink,
                 accept_closed,
                 #[cfg(target_os = "linux")]
@@ -220,10 +232,11 @@ where
                     sockaddr_in6, // IPV6_RECVORIGDSTADDR
                     u32 // SO_MARK
                 ),
+
                 config,
 
-                current_buf: BufFactory::get_max_buf(),
-
+                #[cfg(target_os = "linux")]
+                buf: Vec::new(),
                 #[cfg(target_os = "linux")]
                 metrics_handshake_time_seconds: metrics.handshake_time_seconds(labels::QuicHandshakeStage::QueueWaiting),
                 #[cfg(target_os = "linux")]
@@ -335,6 +348,7 @@ where
             } else {
                 self.config.has_ipv6pktinfo
             },
+            pool_send_buffer: self.config.pool_send_buffer,
         };
 
         let handshake_info = HandshakeInfo::new(
@@ -401,10 +415,20 @@ where
     fn poll_recv_from(
         &mut self, cx: &mut Context<'_>,
     ) -> Poll<io::Result<PollRecvData>> {
-        let mut buf = tokio::io::ReadBuf::new(&mut self.current_buf);
-        let addr = ready!(self.socket_rx.poll_recv_from(cx, &mut buf))?;
+        let mut buf = Vec::with_capacity(datagram_socket::MAX_DATAGRAM_SIZE);
+        // We use ReadBuf's ability to write to uninitialized memory to avoid
+        // the cost of having to initialize the Vec.
+        let mut read_buf = tokio::io::ReadBuf::uninit(buf.spare_capacity_mut());
+        let addr = ready!(self.socket_rx.poll_recv_from(cx, &mut read_buf))?;
+        let n = read_buf.filled().len();
+        unsafe {
+            // Safety: ReadBuf has guaranteed that `n` initialized bytes have
+            // been written to the buffer, so we can set the vec's length
+            // accordingly
+            buf.set_len(n);
+        }
         Poll::Ready(Ok(PollRecvData {
-            bytes: buf.filled().len(),
+            buf,
             src_addr: addr,
             rx_time: None,
             gro: None,
@@ -433,14 +457,19 @@ where
             use std::os::fd::AsRawFd;
             use tokio::io::Interest;
 
+            use crate::buf_factory::BufFactory;
+
             let Some(udp_socket) = self.socket_rx.as_udp_socket() else {
                 // the given socket is not a UDP socket, fall back to the
                 // simple poll_recv_from.
                 return self.poll_recv_from(cx);
             };
 
+            // Note, the resize will be a no-op after the first call since
+            // we never truncate the `self.buf`
+            self.buf.resize(BufFactory::MAX_BUF_SIZE, 0u8);
             loop {
-                let iov_s = &mut [io::IoSliceMut::new(&mut self.current_buf)];
+                let iov_s = &mut [io::IoSliceMut::new(&mut self.buf)];
                 match udp_socket.try_io(Interest::READABLE, || {
                     recvmsg::<SockaddrStorage>(
                         udp_socket.as_raw_fd(),
@@ -451,7 +480,12 @@ where
                     .map_err(|x| x.into())
                 }) {
                     Ok(r) => {
-                        let bytes = r.bytes;
+                        let filled_buf =
+                            r.iovs().next().map(Vec::from).unwrap_or_default();
+                        // The slices returend by `nix::socket::recvmsg`'s result
+                        // add up to `r.bytes`. This assert is just to make sure
+                        // the code handles the result correctly.
+                        debug_assert_eq!(r.bytes, filled_buf.len());
 
                         let address = match r.address {
                             Some(inner) => inner,
@@ -480,7 +514,7 @@ where
                         let Ok(cmsgs) = r.cmsgs() else {
                             // Best-effort if we can't read cmsgs.
                             return Poll::Ready(Ok(PollRecvData {
-                                bytes,
+                                buf: filled_buf,
                                 src_addr: peer_addr,
                                 dst_addr_override,
                                 rx_time,
@@ -592,7 +626,7 @@ where
                         }
 
                         return Poll::Ready(Ok(PollRecvData {
-                            bytes,
+                            buf: filled_buf,
                             src_addr: peer_addr,
                             dst_addr_override,
                             rx_time,
@@ -616,16 +650,94 @@ where
         }
     }
 
-    fn handle_conn_map_commands(&mut self) {
-        while let Ok(req) = self.conn_map_cmd_rx.try_recv() {
-            match req {
-                ConnectionMapCommand::MapCid {
-                    existing_cid,
-                    new_cid,
-                } => self.conns.map_cid(&existing_cid, &new_cid),
-                ConnectionMapCommand::UnmapCid(cid) => self.conns.unmap_cid(&cid),
+    fn poll_process_packet(&mut self, cx: &mut Context) -> Poll<()> {
+        let pkt_data = match ready!(self.poll_recv_and_rx_time(cx)) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("Incoming packet router encountered recvmsg error"; "error" => e);
+                return Poll::Ready(());
+            },
+        };
+
+        let PollRecvData {
+            buf,
+            src_addr: peer_addr,
+            dst_addr_override,
+            rx_time,
+            gro,
+            #[cfg(target_os = "linux")]
+            so_mark_data,
+        } = pkt_data;
+
+        let send_from = if let Some(dst_addr) = dst_addr_override {
+            log::trace!("overriding local address"; "actual_local" => dst_addr, "configured_local" => self.local_addr);
+            dst_addr
+        } else {
+            self.local_addr
+        };
+
+        let res = self.on_incoming(Incoming {
+            peer_addr,
+            local_addr: send_from,
+            buf,
+            rx_time,
+            gro,
+            #[cfg(target_os = "linux")]
+            so_mark_data,
+        });
+
+        // Only error handling below - if `on_incoming` was successful,
+        // we return here
+        let Err(e) = res else {
+            return Poll::Ready(());
+        };
+
+        let err_type = initial_packet_error_type(&e);
+        self.metrics
+            .rejected_initial_packet_count(err_type.clone())
+            .inc();
+
+        if self.config.enable_expensive_packet_count_metrics {
+            if let Some(peer_ip) =
+                quic_expensive_metrics_ip_reduce(peer_addr.ip())
+            {
+                self.metrics
+                    .expensive_rejected_initial_packet_count(
+                        err_type.clone(),
+                        peer_ip,
+                    )
+                    .inc();
             }
         }
+
+        if matches!(err_type, labels::QuicInvalidInitialPacketError::Unexpected) {
+            // don't block packet routing on errors
+            let _ = self.accept_sink.try_send(Err(e));
+        }
+
+        Poll::Ready(())
+    }
+
+    fn poll_conn_map_commands(&mut self, cx: &mut Context) -> Poll<()> {
+        let cmd_rx = &mut self.conn_map_cmd_rx;
+        let buf = &mut self.conn_map_cmd_buf;
+        debug_assert!(buf.is_empty());
+
+        while ready!(cmd_rx.poll_recv_many(cx, buf, CONN_MAP_CMD_BATCH_SIZE)) > 0
+        {
+            for cmd in buf.drain(..) {
+                match cmd {
+                    ConnectionMapCommand::MapCid {
+                        existing_cid,
+                        new_cid,
+                    } => self.conns.map_cid(&existing_cid, &new_cid),
+                    ConnectionMapCommand::UnmapCid(cid) =>
+                        self.conns.unmap_cid(&cid),
+                }
+            }
+        }
+
+        Poll::Ready(())
     }
 }
 
@@ -683,106 +795,42 @@ where
     type Output = io::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        let server_addr = self.local_addr;
-
         loop {
+            // Register a waker so dropping the accept stream wakes the Router.
+            let _ = self.accept_closed.as_mut().poll(cx);
+
+            // First, check whether the app stopped accepting connections.
+            if self.shutdown_tx.is_some() && self.accept_sink.is_closed() {
+                self.shutdown_tx = None;
+            }
+
+            // Second, check if all connections have shut down and we can exit.
+            if self.shutdown_tx.is_none() &&
+                self.shutdown_rx.poll_recv(cx).is_ready()
+            {
+                return Poll::Ready(Ok(()));
+            }
+
+            // Third, run the generic `InitialPacketHandler` update.
             if let Err(error) = self.incoming_packet_handler.update(cx) {
-                // This is so rare that it's easier to spawn a separate task
+                // An error here is so rare that it's easier to spawn a separate
+                // task
                 let sender = self.accept_sink.clone();
                 spawn_with_killswitch(async move {
                     let _ = sender.send(Err(error)).await;
                 });
             }
 
-            match self.poll_recv_and_rx_time(cx) {
-                Poll::Ready(Ok(PollRecvData {
-                    bytes,
-                    src_addr: peer_addr,
-                    dst_addr_override,
-                    rx_time,
-                    gro,
-                    #[cfg(target_os = "linux")]
-                    so_mark_data,
-                })) => {
-                    let mut buf = std::mem::replace(
-                        &mut self.current_buf,
-                        BufFactory::get_max_buf(),
-                    );
-                    buf.truncate(bytes);
+            // Fourth, update ConnectionMap before receiving packets. This ensures
+            // our SCID destinations are up-to-date (as of this moment).
+            // If this returns pending, we have processed all available commands
+            // and are registered for a wakeup on the next command.
+            let _ = self.poll_conn_map_commands(cx);
 
-                    let send_from = if let Some(dst_addr) = dst_addr_override {
-                        log::trace!("overriding local address"; "actual_local" => dst_addr, "configured_local" => server_addr);
-                        dst_addr
-                    } else {
-                        server_addr
-                    };
-
-                    let res = self.on_incoming(Incoming {
-                        peer_addr,
-                        local_addr: send_from,
-                        buf,
-                        rx_time,
-                        gro,
-                        #[cfg(target_os = "linux")]
-                        so_mark_data,
-                    });
-
-                    if let Err(e) = res {
-                        let err_type = initial_packet_error_type(&e);
-                        self.metrics
-                            .rejected_initial_packet_count(err_type.clone())
-                            .inc();
-
-                        if self.config.enable_expensive_packet_count_metrics {
-                            if let Some(peer_ip) =
-                                quic_expensive_metrics_ip_reduce(peer_addr.ip())
-                            {
-                                self.metrics
-                                    .expensive_rejected_initial_packet_count(
-                                        err_type.clone(),
-                                        peer_ip,
-                                    )
-                                    .inc();
-                            }
-                        }
-
-                        if matches!(
-                            err_type,
-                            labels::QuicInvalidInitialPacketError::Unexpected
-                        ) {
-                            // don't block packet routing on errors
-                            let _ = self.accept_sink.try_send(Err(e));
-                        }
-                    }
-                },
-
-                Poll::Ready(Err(e)) => {
-                    log::error!("Incoming packet router encountered recvmsg error"; "error" => e);
-                    continue;
-                },
-
-                Poll::Pending => {
-                    // Register a waker for accept stream closure so the Router
-                    // is woken when the receiver is dropped. Without this, a
-                    // failed handshake leaves the Router stuck in Pending forever
-                    // because no other event (socket data, shutdown_rx) fires.
-                    let _ = self.accept_closed.as_mut().poll(cx);
-
-                    // Check whether any connections are still active
-                    if self.shutdown_tx.is_some() && self.accept_sink.is_closed()
-                    {
-                        self.shutdown_tx = None;
-                    }
-
-                    if self.shutdown_rx.poll_recv(cx).is_ready() {
-                        return Poll::Ready(Ok(()));
-                    }
-
-                    // Process any incoming connection map signals and handle them
-                    self.handle_conn_map_commands();
-
-                    return Poll::Pending;
-                },
+            // Finally, process up to `PACKET_RX_YIELD_AFTER` packet (batches) at
+            // once. If no more packets are available, we wait to be woken again.
+            for _ in 0..PACKET_RX_YIELD_AFTER {
+                ready!(self.poll_process_packet(cx));
             }
         }
     }
@@ -827,7 +875,8 @@ pub trait InitialPacketHandler {
 /// A [`NewConnection`] describes a new [`quiche::Connection`] that can be
 /// driven by an io worker.
 pub struct NewConnection {
-    conn: QuicheConnection,
+    /// See [`QuicConnectionParams::quiche_conn`].
+    conn: Box<QuicheConnection>,
     pending_cid: Option<ConnectionId<'static>>,
     initial_pkt: Option<Incoming>,
     cid_generator: Option<SharedConnectionIdGenerator>,
@@ -852,11 +901,13 @@ mod tests {
     use crate::settings::QuicSettings;
     use crate::settings::TlsCertificatePaths;
     use crate::socket::SocketCapabilities;
+    use crate::ConnectionIdGenerator as _;
     use crate::ConnectionParams;
     use crate::ServerH3Driver;
 
     use datagram_socket::MAX_DATAGRAM_SIZE;
     use h3i::actions::h3::Action;
+    use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::UdpSocket;
@@ -926,6 +977,7 @@ mod tests {
             ConnectionAcceptorConfig {
                 disable_client_ip_validation: config.disable_client_ip_validation,
                 qlog_dir: config.qlog_dir.clone(),
+                qlog_compression: config.qlog_compression,
                 keylog_file: config
                     .keylog_file
                     .as_ref()
@@ -967,5 +1019,160 @@ mod tests {
         // NOTE: this is a smoke test - in case of issues `notified()` future will
         // never resolve hanging the test.
         drop_check.closed().await;
+    }
+
+    struct NoopDatagramSender;
+    impl DatagramSocketSend for NoopDatagramSender {
+        fn poll_send(
+            &self, _cx: &mut Context, buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_send_to(
+            &self, _cx: &mut Context, buf: &[u8], _addr: SocketAddr,
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+    }
+
+    struct AlwaysReadyReceiver;
+    impl DatagramSocketRecv for AlwaysReadyReceiver {
+        fn poll_recv(
+            &mut self, _cx: &mut Context, buf: &mut tokio::io::ReadBuf,
+        ) -> Poll<io::Result<()>> {
+            // Short header packet:
+            // 1 byte descriptor + 20 byte DCID + 1 byte packet number + payload
+            const DUMMY_QUIC_PACKET: &[u8] =
+                b"\x40THIS_20_BYTE_CONN_ID\x06payload_payload_payload";
+            buf.put_slice(DUMMY_QUIC_PACKET);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct NoopInitialHandler;
+    impl InitialPacketHandler for NoopInitialHandler {
+        fn handle_initials(
+            &mut self, _incoming: Incoming, _hdr: Header<'static>,
+            _quiche_config: &mut quiche::Config,
+        ) -> io::Result<Option<NewConnection>> {
+            Ok(None)
+        }
+    }
+
+    struct NotifyingPendingReceiver {
+        first_poll_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl DatagramSocketRecv for NotifyingPendingReceiver {
+        fn poll_recv(
+            &mut self, _cx: &mut Context, _buf: &mut tokio::io::ReadBuf,
+        ) -> Poll<io::Result<()>> {
+            if let Some(tx) = self.first_poll_tx.take() {
+                let _ = tx.send(());
+            }
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn test_accept_stream_drop_wakes_router() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            QuicSettings::default(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+        let (first_poll_tx, first_poll_rx) = tokio::sync::oneshot::channel();
+
+        let (router, accept_stream) = InboundPacketRouter::new(
+            config,
+            Arc::new(NoopDatagramSender),
+            NotifyingPendingReceiver {
+                first_poll_tx: Some(first_poll_tx),
+            },
+            local_addr,
+            NoopInitialHandler,
+            DefaultMetrics,
+        );
+        let router = tokio::spawn(router);
+
+        first_poll_rx.await.unwrap();
+        drop(accept_stream);
+
+        let result = time::timeout(Duration::from_secs(1), router).await;
+        assert!(
+            result.is_ok(),
+            "router was not woken when the accept stream receiver was dropped"
+        );
+    }
+
+    #[test]
+    fn test_poll_packet_always_ready() {
+        let tls_cert_settings = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let params = ConnectionParams::new_server(
+            QuicSettings::default(),
+            tls_cert_settings,
+            Hooks::default(),
+        );
+
+        let config = Config::new(&params, SocketCapabilities::default()).unwrap();
+        let local_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0);
+
+        let (mut ipr, accept_stream) = InboundPacketRouter::new(
+            config,
+            Arc::new(NoopDatagramSender),
+            AlwaysReadyReceiver,
+            local_addr,
+            NoopInitialHandler,
+            DefaultMetrics,
+        );
+        let conn_map_cmd_tx = ipr.conn_map_cmd_tx.clone();
+
+        // Keep polling the IPR in a busy loop until it resolves
+        let (ipr_notifier, ipr_done) = std::sync::mpsc::sync_channel::<()>(0);
+        let ipr = std::thread::spawn(move || {
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            while ipr.poll_unpin(&mut cx).is_pending() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(ipr_notifier);
+            ipr
+        });
+
+        // Fill the `conn_map_cmd` channel with some messages to process
+        for _ in 0..20 {
+            let random_cid = SimpleConnectionIdGenerator.new_connection_id();
+            conn_map_cmd_tx
+                .send(ConnectionMapCommand::UnmapCid(random_cid))
+                .unwrap();
+        }
+        // Give the IPR some time to process the ConnectionMapCommands
+        std::thread::sleep(Duration::from_secs(1));
+
+        // Shut the IPR down by dropping the accept_stream receiver. We wait for
+        // up to 10 seconds for IPR::poll to resolve. If it doesn't, it's not
+        // checking the shutdown condition regularly.
+        drop(accept_stream);
+        let ipr_done_res = ipr_done.recv_timeout(Duration::from_secs(10));
+        assert_eq!(
+            ipr_done_res,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        );
+
+        // Check that the ConnectionMapCommands we added above were actually
+        // processed
+        let ipr = ipr.join().unwrap();
+        assert!(ipr.conn_map_cmd_rx.is_empty());
     }
 }
